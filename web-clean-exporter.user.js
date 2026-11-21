@@ -15,10 +15,154 @@
 (function () {
     'use strict';
 
-    // 避免在 iframe 中重复注入
-    if (window.top !== window.self) return;
-
     const APP_PREFIX = 'cre-exporter';
+
+    // ==================== 0. 跨源/同源 iframe 文档预览框提取子模块 ====================
+    // 当网页使用内嵌可滚动 iframe（如下拉文档预览框）展示 Word/PDF 时，脚本在 iframe 内部静默运行，
+    // 不渲染任何悬浮按钮，仅响应顶层窗口的 postMessage 提取请求并返回纯净 HTML（含 Canvas 转图与图片转 Base64）。
+    if (window.top !== window.self) {
+        const iframeCanvasCache = new Map();
+
+        function cacheIframeCanvases() {
+            document.querySelectorAll('canvas').forEach((c) => {
+                try {
+                    if (c.width >= 30 && c.height >= 20) {
+                        const dataUrl = c.toDataURL('image/png');
+                        if (dataUrl && dataUrl.length > 1400) {
+                            const prev = iframeCanvasCache.get(c);
+                            if (!prev || dataUrl.length >= prev.length) {
+                                iframeCanvasCache.set(c, dataUrl);
+                            }
+                        }
+                    }
+                } catch (_) {}
+            });
+        }
+
+        let iframeScrollTimer = null;
+        window.addEventListener('scroll', () => {
+            clearTimeout(iframeScrollTimer);
+            iframeScrollTimer = setTimeout(cacheIframeCanvases, 250);
+        }, { passive: true });
+        setTimeout(cacheIframeCanvases, 800);
+
+        async function extractIframeDocumentHtml(isDeep = false) {
+            cacheIframeCanvases();
+            const root = document.body;
+            if (!root) return '';
+
+            const clone = root.cloneNode(true);
+
+            // 1. 转换 iframe 内所有 Canvas 为 <img>
+            const origCanvases = root.querySelectorAll('canvas');
+            const cloneCanvases = clone.querySelectorAll('canvas');
+            if (origCanvases.length === cloneCanvases.length) {
+                origCanvases.forEach((origC, idx) => {
+                    let dataUrl = null;
+                    try {
+                        if (origC.width >= 30 && origC.height >= 20) {
+                            const d = origC.toDataURL('image/png');
+                            if (d && d.length > 1400) dataUrl = d;
+                        }
+                    } catch (_) {}
+                    dataUrl = dataUrl || iframeCanvasCache.get(origC);
+                    if (dataUrl) {
+                        const img = document.createElement('img');
+                        img.src = dataUrl;
+                        img.className = `${APP_PREFIX}-block-img`;
+                        img.style.display = 'block';
+                        img.style.maxWidth = '100%';
+                        img.style.height = 'auto';
+                        cloneCanvases[idx].replaceWith(img);
+                    } else {
+                        cloneCanvases[idx].remove();
+                    }
+                });
+            }
+
+            // 2. 移除隐藏节点（非深度模式下）与脚本/表单噪音
+            if (!isDeep) {
+                const origEls = root.querySelectorAll('*');
+                const cloneEls = clone.querySelectorAll('*');
+                if (origEls.length === cloneEls.length) {
+                    for (let i = origEls.length - 1; i >= 0; i--) {
+                        const tag = origEls[i].tagName.toUpperCase();
+                        if (['BR', 'IMG', 'SVG', 'MATH'].includes(tag)) continue;
+                        const st = window.getComputedStyle(origEls[i]);
+                        if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity) === 0) {
+                            cloneEls[i].remove();
+                        }
+                    }
+                }
+            }
+
+            clone.querySelectorAll('script, style, noscript, iframe, button, input, select, textarea, nav, aside, footer').forEach(n => n.remove());
+
+            // 3. 修复图片绝对路径并在 iframe 自身同源上下文内尝试转为 Base64（彻底绕过跨源限制）
+            const imgs = Array.from(clone.querySelectorAll('img'));
+            await Promise.all(imgs.map(async (img) => {
+                const lazy = img.getAttribute('data-src') || img.getAttribute('data-original') || img.getAttribute('data-actualsrc');
+                if ((!img.getAttribute('src') || img.getAttribute('src').startsWith('data:image/svg')) && lazy) {
+                    img.setAttribute('src', lazy);
+                }
+                const absSrc = img.src || img.getAttribute('src');
+                if (!absSrc) return;
+                img.setAttribute('src', absSrc);
+                if (!absSrc.startsWith('data:image/')) {
+                    try {
+                        const resp = await fetch(absSrc, { credentials: 'include' });
+                        if (resp.ok) {
+                            const blob = await resp.blob();
+                            if (blob.type && blob.type.startsWith('image/')) {
+                                const b64 = await new Promise((res) => {
+                                    const r = new FileReader();
+                                    r.onloadend = () => res(typeof r.result === 'string' && r.result.startsWith('data:image/') ? r.result : absSrc);
+                                    r.onerror = () => res(absSrc);
+                                    r.readAsDataURL(blob);
+                                });
+                                img.setAttribute('src', b64);
+                            }
+                        }
+                    } catch (_) {}
+                }
+                img.style.maxWidth = '100%';
+                img.style.height = 'auto';
+            }));
+
+            // 4. 解除滚动框固定高度与滚动裁剪，让所有页展开展示
+            clone.querySelectorAll('*').forEach((el) => {
+                if (el.style) {
+                    if (el.style.position === 'fixed' || el.style.position === 'sticky') {
+                        el.style.position = 'static';
+                    }
+                    el.style.maxHeight = 'none';
+                    el.style.overflow = 'visible';
+                    if (el.style.height && el.style.height.endsWith('px') && ['DIV', 'SECTION', 'MAIN', 'ARTICLE'].includes(el.tagName)) {
+                        el.style.height = 'auto';
+                    }
+                }
+            });
+
+            return clone.innerHTML.trim();
+        }
+
+        window.addEventListener('message', async (event) => {
+            const data = event.data;
+            if (!data || data.type !== 'CRE_EXTRACT_IFRAME_REQ' || !data.requestId) return;
+            try {
+                const html = await extractIframeDocumentHtml(Boolean(data.deep));
+                if (event.source && typeof event.source.postMessage === 'function') {
+                    event.source.postMessage({
+                        type: 'CRE_EXTRACT_IFRAME_RES',
+                        requestId: data.requestId,
+                        html
+                    }, '*');
+                }
+            } catch (_) {}
+        });
+
+        return;
+    }
 
     // ==================== 1. 样式注入 ====================
     const CSS_STYLES = `
@@ -691,6 +835,146 @@
     }
 
     /**
+     * 判断 iframe 是否为文档/正文内容预览框（排除广告 iframe 与本脚本打印 iframe）
+     */
+    function isContentIframe(iframe) {
+        if (!iframe || iframe.tagName !== 'IFRAME') return false;
+        if (isOwnPluginElement(iframe)) return false;
+        const meta = `${iframe.src || ''} ${iframe.id || ''} ${typeof iframe.className === 'string' ? iframe.className : ''}`.toLowerCase();
+        if (/(doubleclick|googlesyndication|adservice|cpro|tanx|union|hm\.baidu|pos\.baidu|advert|banner-ad)/i.test(meta)) {
+            return false;
+        }
+        if (!isElementVisible(iframe) || isEdgeSidebarRegion(iframe)) return false;
+        const rect = iframe.getBoundingClientRect();
+        return rect.width >= 300 && rect.height >= 180;
+    }
+
+    /**
+     * 从单个文档预览 iframe 中提取纯净 HTML（优先同源直读，跨源时通过 postMessage 与子模块通信提取）
+     */
+    function extractHtmlFromIframe(iframe, isDeep = false) {
+        return new Promise((resolve) => {
+            if (!iframe) {
+                resolve('');
+                return;
+            }
+
+            // 1. 尝试同源直接读取 contentDocument
+            try {
+                const doc = iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
+                if (doc && doc.body) {
+                    const clone = doc.body.cloneNode(true);
+                    const origCanvases = doc.body.querySelectorAll('canvas');
+                    const cloneCanvases = clone.querySelectorAll('canvas');
+                    if (origCanvases.length === cloneCanvases.length) {
+                        origCanvases.forEach((c, idx) => {
+                            try {
+                                if (c.width >= 30 && c.height >= 20) {
+                                    const d = c.toDataURL('image/png');
+                                    if (d && d.length > 1400) {
+                                        const img = doc.createElement('img');
+                                        img.src = d;
+                                        img.className = `${APP_PREFIX}-block-img`;
+                                        cloneCanvases[idx].replaceWith(img);
+                                        return;
+                                    }
+                                }
+                            } catch (_) {}
+                            cloneCanvases[idx].remove();
+                        });
+                    }
+                    clone.querySelectorAll('script, style, noscript, iframe, button, input, select, textarea, nav, aside, footer').forEach(n => n.remove());
+                    clone.querySelectorAll('img').forEach(img => {
+                        const lazy = img.getAttribute('data-src') || img.getAttribute('data-original') || img.getAttribute('data-actualsrc');
+                        if ((!img.getAttribute('src') || img.getAttribute('src').startsWith('data:image/svg')) && lazy) {
+                            img.setAttribute('src', lazy);
+                        }
+                        if (img.src) img.setAttribute('src', img.src);
+                        img.style.maxWidth = '100%';
+                        img.style.height = 'auto';
+                    });
+                    clone.querySelectorAll('*').forEach(el => {
+                        if (el.style) {
+                            el.style.maxHeight = 'none';
+                            el.style.overflow = 'visible';
+                            if (el.style.height && el.style.height.endsWith('px') && ['DIV', 'SECTION', 'MAIN', 'ARTICLE'].includes(el.tagName)) {
+                                el.style.height = 'auto';
+                            }
+                        }
+                    });
+                    const html = clone.innerHTML.trim();
+                    if (html) {
+                        resolve(html);
+                        return;
+                    }
+                }
+            } catch (_) {
+                // 跨源 iframe，转入 postMessage 通道
+            }
+
+            // 2. 跨源 iframe：通过 postMessage 向子窗口内运行的脚本请求正文 HTML
+            if (!iframe.contentWindow) {
+                resolve('');
+                return;
+            }
+            const requestId = `cre_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+            let settled = false;
+
+            function onMessage(event) {
+                const data = event.data;
+                if (!data || data.type !== 'CRE_EXTRACT_IFRAME_RES' || data.requestId !== requestId) return;
+                settled = true;
+                clearTimeout(timer);
+                window.removeEventListener('message', onMessage);
+                resolve(typeof data.html === 'string' ? data.html : '');
+            }
+
+            const timer = setTimeout(() => {
+                if (!settled) {
+                    settled = true;
+                    window.removeEventListener('message', onMessage);
+                    resolve('');
+                }
+            }, 2200);
+
+            window.addEventListener('message', onMessage);
+            try {
+                iframe.contentWindow.postMessage({
+                    type: 'CRE_EXTRACT_IFRAME_REQ',
+                    requestId,
+                    deep: isDeep
+                }, '*');
+            } catch (_) {
+                clearTimeout(timer);
+                window.removeEventListener('message', onMessage);
+                resolve('');
+            }
+        });
+    }
+
+    /**
+     * 批量异步提取容器内所有文档预览 iframe 的内容，返回 Map<HTMLIFrameElement, string>
+     */
+    async function collectContentIframes(rootNode, isDeep = false) {
+        const resultMap = new Map();
+        if (!rootNode) return resultMap;
+
+        const iframes = rootNode.tagName === 'IFRAME'
+            ? (isContentIframe(rootNode) ? [rootNode] : [])
+            : Array.from(rootNode.querySelectorAll('iframe')).filter(isContentIframe);
+
+        if (iframes.length === 0) return resultMap;
+
+        await Promise.all(iframes.map(async (frame) => {
+            const html = await extractHtmlFromIframe(frame, isDeep);
+            if (html && html.trim().length > 0) {
+                resultMap.set(frame, html);
+            }
+        }));
+        return resultMap;
+    }
+
+    /**
      * 查找页面上所有已渲染的 A4 文档级大画布（仅针对百度文库、PDF.js 等整页大画布阅读器，彻底排除 ECharts 统计饼图）
      */
     function findDocumentPageCanvases(root = document.body) {
@@ -766,6 +1050,7 @@
 
         const text = (el.innerText || '').trim();
         const docCanvases = findDocumentPageCanvases(el);
+        const contentIframes = Array.from(el.querySelectorAll('iframe')).filter(isContentIframe);
 
         // 统计容器内的试题图片条或试题配图（兼容组卷网等将每道题或公式渲染为图片 <img> 的题库网站）
         const questionImages = Array.from(el.querySelectorAll('img')).filter(img => {
@@ -781,9 +1066,16 @@
         const optionGroups = (text.match(/[AＡ]\s*[.．、][\s\S]{1,120}[BＢ]\s*[.．、]/g) || []).length;
         const numberedQuestions = (text.match(/(?:^|\n)\s*\d{1,2}\s*[.．、]/g) || []).length;
 
-        if (text.length < 30 && docCanvases.length === 0 && questionImages === 0) return 0;
+        if (text.length < 30 && docCanvases.length === 0 && questionImages === 0 && contentIframes.length === 0) return 0;
 
         let score = 0;
+
+        // 0. 包含内嵌文档预览 iframe 或独立内部滚动文档框的高权重加分
+        score += contentIframes.length * 600;
+        const elStyle = window.getComputedStyle(el);
+        if ((elStyle.overflowY === 'auto' || elStyle.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 80 && el.getBoundingClientRect().width >= 420) {
+            score += 240;
+        }
 
         // 1. 真实试卷题目选项与编号题干给予最高优先级（彻底压倒“试卷分析/细目表”）
         score += Math.min(optionGroups * 150, 1500);
@@ -866,6 +1158,20 @@
         }
 
         try {
+            // 优先检查：如果页面正中央存在大尺寸文档预览 iframe（如在线 Word/PDF 下拉滚动预览框），直接优先定位该 iframe
+            const pageContentIframes = Array.from(document.querySelectorAll('iframe')).filter(isContentIframe);
+            if (pageContentIframes.length > 0) {
+                const largestIframe = pageContentIframes.sort((a, b) => {
+                    const ra = a.getBoundingClientRect();
+                    const rb = b.getBoundingClientRect();
+                    return (rb.width * rb.height) - (ra.width * ra.height);
+                })[0];
+                const lRect = largestIframe.getBoundingClientRect();
+                if (lRect.width >= 420 && lRect.height >= 260) {
+                    return largestIframe;
+                }
+            }
+
             // 仅当页面不存在题库试题块，且存在 >=2 个纵向 A4 文档级大画布（如百度文库）时，才走画布 LCA 快速通道
             const hasQuestionItems = document.querySelectorAll('[class*="quest"], [class*="timu"], .paper-cnt, .paper-body').length > 0;
             const docCanvases = findDocumentPageCanvases(document.body);
@@ -1006,10 +1312,22 @@
     }
 
     /**
-     * 提取并清洗目标 DOM 节点，保留排版、行内公式图片、独立大图、表格、Canvas 与公式
+     * 提取并清洗目标 DOM 节点，保留排版、行内公式图片、独立大图、内嵌 iframe 文档框、表格、Canvas 与公式
      */
-    function extractAndCleanNode(sourceNode, forceCanvasOnly = false, isManualSelection = false) {
+    function extractAndCleanNode(sourceNode, forceCanvasOnly = false, isManualSelection = false, iframeHtmlMap = null) {
         scanAndCacheVisibleCanvases();
+
+        // 若目标节点本身就是一个文档预览 iframe，直接返回异步提取到的 iframe 内部文档内容
+        const sourceTag = sourceNode.tagName ? sourceNode.tagName.toUpperCase() : '';
+        if (sourceTag === 'IFRAME') {
+            const cleanRoot = document.createElement('div');
+            cleanRoot.className = `${APP_PREFIX}-extracted-content ${APP_PREFIX}-iframe-doc-mode`;
+            const frameHtml = iframeHtmlMap && iframeHtmlMap.get(sourceNode);
+            if (frameHtml) {
+                cleanRoot.innerHTML = frameHtml;
+            }
+            return cleanRoot;
+        }
 
         // 仅当用户手动点击“仅提画布页”，或目标容器是纯大画布阅读器（不含普通题库题目块且非用户手动框选）时，才走纯画布页模式
         const docCanvases = findDocumentPageCanvases(sourceNode);
@@ -1029,7 +1347,6 @@
         }
 
         // 若用户直接点选了单张 <img> 或单个 <canvas> 节点，直接包装导出，避免因无 firstChild 而变空白
-        const sourceTag = sourceNode.tagName ? sourceNode.tagName.toUpperCase() : '';
         if (sourceTag === 'IMG') {
             const cleanRoot = document.createElement('div');
             cleanRoot.className = `${APP_PREFIX}-extracted-content`;
@@ -1087,6 +1404,32 @@
                     cloneCanvas.remove();
                 }
             });
+        }
+
+        // 1.1 在删除噪音节点前，优先将已提取到的文档预览 iframe 替换为真实 DOM 内容块，并解除其父容器固定高度滚动裁剪
+        if (iframeHtmlMap && iframeHtmlMap.size > 0) {
+            const origIframes = sourceNode.querySelectorAll('iframe');
+            const cloneIframes = clone.querySelectorAll('iframe');
+            if (origIframes.length === cloneIframes.length) {
+                origIframes.forEach((origFrame, idx) => {
+                    const frameHtml = iframeHtmlMap.get(origFrame);
+                    if (frameHtml) {
+                        const frameDiv = document.createElement('div');
+                        frameDiv.className = `${APP_PREFIX}-iframe-content`;
+                        frameDiv.innerHTML = frameHtml;
+                        let parent = cloneIframes[idx].parentElement;
+                        while (parent && parent !== clone) {
+                            if (parent.style) {
+                                parent.style.height = 'auto';
+                                parent.style.maxHeight = 'none';
+                                parent.style.overflow = 'visible';
+                            }
+                            parent = parent.parentElement;
+                        }
+                        cloneIframes[idx].replaceWith(frameDiv);
+                    }
+                });
+            }
         }
 
         // 2. 标记原页面中的宽幅试题图片（宽 >= 200 且高 >= 22，例如组卷网的整道题图片条或几何配图），而将窄小的行内公式图片保持为 inline-block 垂直居中
@@ -1189,11 +1532,16 @@
             }
         });
 
-        // 4.1 移除底部“剩余XX%未预览/未读、开通VIP、加入备课/挑错建议/版权异议、添加题型下试题”等非正文提示块
+        // 4.1 移除底部“剩余XX%未预览/未读、开通VIP、加入备课/挑错建议/版权异议、添加题型下试题、相关推荐列表”等非正文块
         const PROMO_BANNER_REGEX = /(剩余\s*\d+\s*[%页]\s*(未预览|未读)|开通\s*VIP\s*会员|新客免费下载|加入备课[\s\S]{0,40}(挑错建议|版权异议)|^添加题型下试题$|^显示全部答案和解析$)/i;
+        const RECOMMEND_LIST_REGEX = /^(相关推荐|相关文档|猜你喜欢|热门推荐)/;
         Array.from(clone.querySelectorAll('div, section, aside, p, a, span')).forEach(el => {
             const txt = (el.innerText || el.textContent || '').trim();
             if (txt.length > 0 && txt.length < 220 && PROMO_BANNER_REGEX.test(txt) && !el.querySelector('table, article, img')) {
+                el.remove();
+                return;
+            }
+            if (txt.length > 0 && txt.length < 1500 && RECOMMEND_LIST_REGEX.test(txt) && /(阅读|下载)/.test(txt) && !el.querySelector(`.${APP_PREFIX}-iframe-content`)) {
                 el.remove();
             }
         });
@@ -1229,6 +1577,9 @@
                 el.style.overflow = 'visible';
                 el.style.userSelect = 'auto';
                 if (['DIV', 'SECTION', 'ARTICLE', 'LI', 'UL'].includes(el.tagName)) {
+                    if (el.style.height && el.style.height.endsWith('px')) {
+                        el.style.height = 'auto';
+                    }
                     el.style.setProperty('border', 'none', 'important');
                     el.style.setProperty('box-shadow', 'none', 'important');
                     el.style.setProperty('background', 'transparent', 'important');
@@ -1293,11 +1644,15 @@
      * @param {boolean} filterNoise - 是否跳过导航栏/广告/侧边栏等明显噪音容器，默认 true
      * @returns {string} 按原顺序拼接好的完整 HTML 字符串
      */
-    function extractAllDomWithHiddenAndPseudo(rootNode = document.body, filterNoise = true) {
+    function extractAllDomWithHiddenAndPseudo(rootNode = document.body, filterNoise = true, iframeHtmlMap = null) {
         scanAndCacheVisibleCanvases();
 
+        if (rootNode && rootNode.tagName === 'IFRAME' && iframeHtmlMap && iframeHtmlMap.get(rootNode)) {
+            return iframeHtmlMap.get(rootNode);
+        }
+
         const SKIP_TAGS = new Set([
-            'SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'IFRAME',
+            'SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE',
             'OBJECT', 'EMBED', 'HEAD', 'META', 'LINK', 'BUTTON',
             'INPUT', 'SELECT', 'TEXTAREA'
         ]);
@@ -1325,6 +1680,12 @@
 
             // 跳过脚本、样式及本插件自身注入的 UI 节点
             if (SKIP_TAGS.has(tag) || isOwnPluginElement(el)) return '';
+
+            // 1.1 若为文档预览 iframe，直接内联其提取结果
+            if (tag === 'IFRAME') {
+                const frameHtml = iframeHtmlMap && iframeHtmlMap.get(el);
+                return frameHtml ? `<div class="${APP_PREFIX}-iframe-content">${frameHtml}</div>` : '';
+            }
 
             // 可选跳过明显的导航、广告、评论、侧边栏噪音块及“试卷分析/细目表”统计弹窗
             if (filterNoise) {
@@ -1994,13 +2355,16 @@
     }
 
     /**
-     * 打开纯净阅读视图并填充提取的内容
+     * 打开纯净阅读视图并填充提取的内容（支持同源与跨源文档预览 iframe 自动异步提取）
      */
-    function openCleanView(customTargetNode = null, forceCanvasOnly = false) {
+    async function openCleanView(customTargetNode = null, forceCanvasOnly = false) {
         const isManual = Boolean(customTargetNode);
         const targetNode = customTargetNode || detectMainContentNode();
         currentSourceNode = targetNode;
-        const cleanedNode = extractAndCleanNode(targetNode, forceCanvasOnly, isManual);
+
+        // 异步提取目标节点内部（或目标本身）的文档预览 iframe 内容
+        const iframeHtmlMap = await collectContentIframes(targetNode, false);
+        const cleanedNode = extractAndCleanNode(targetNode, forceCanvasOnly, isManual, iframeHtmlMap);
 
         paperEl.innerHTML = '';
 
@@ -2017,9 +2381,12 @@
         document.body.style.overflow = 'hidden';
 
         const isCanvasDoc = cleanedNode.classList.contains(`${APP_PREFIX}-canvas-doc-mode`);
+        const isIframeDoc = iframeHtmlMap.size > 0;
         const badgeEl = overlayEl.querySelector(`.${APP_PREFIX}-toolbar-badge`);
         if (badgeEl) {
-            if (isCanvasDoc) {
+            if (isIframeDoc) {
+                badgeEl.textContent = '已自动穿透提取内嵌滚动文档框 (iframe) 全部内容';
+            } else if (isCanvasDoc) {
                 const count = cleanedNode.querySelectorAll('img').length;
                 badgeEl.textContent = `已提取 ${count} 页文档画布（滚动原网页加载更多页后可重提）`;
             } else if (isManual) {
@@ -2033,9 +2400,9 @@
     }
 
     /**
-     * 开启深度全量提取视图（包含被 CSS display:none / visibility:hidden 隐藏的节点及 ::before / ::after 伪元素内容）
+     * 开启深度全量提取视图（包含被 CSS display:none / visibility:hidden 隐藏的节点、::before/::after 伪元素及内嵌 iframe 文档框）
      */
-    function openDeepExtractView(customRoot = null) {
+    async function openDeepExtractView(customRoot = null) {
         const wasOverlayShown = overlayEl && overlayEl.classList.contains('active') && overlayEl.style.display !== 'none';
         if (wasOverlayShown) {
             overlayEl.style.display = 'none';
@@ -2048,7 +2415,8 @@
         }
         currentSourceNode = targetNode;
 
-        const fullHtmlString = extractAllDomWithHiddenAndPseudo(targetNode, true);
+        const iframeHtmlMap = await collectContentIframes(targetNode, true);
+        const fullHtmlString = extractAllDomWithHiddenAndPseudo(targetNode, true, iframeHtmlMap);
 
         if (wasOverlayShown) {
             overlayEl.style.display = '';
@@ -2072,7 +2440,7 @@
 
         const badgeEl = overlayEl.querySelector(`.${APP_PREFIX}-toolbar-badge`);
         if (badgeEl) {
-            badgeEl.textContent = '深度提取模式：已还原 CSS 隐藏节点与 ::before/::after 伪元素';
+            badgeEl.textContent = '深度提取模式：已还原 CSS 隐藏节点、伪元素与内嵌 iframe 文档框';
         }
 
         return paperEl;
@@ -2267,21 +2635,21 @@
             const isAlreadyOpen = overlayEl.classList.contains('active') && paperEl.innerHTML.trim().length > 0;
 
             if (action === 'clean-view') {
-                openCleanView();
+                await openCleanView();
             } else if (action === 'deep-extract') {
-                openDeepExtractView();
-                showToast('🔍 已深度提取页面文字、图片、CSS隐藏节点与伪元素内容');
+                await openDeepExtractView();
+                showToast('🔍 已深度提取页面文字、图片、CSS隐藏节点、伪元素及内嵌 iframe 文档');
             } else if (action === 'pick-area') {
                 if (overlayEl.classList.contains('active')) closeCleanView();
                 startAreaPicker();
             } else if (action === 'export-pdf') {
-                const container = isAlreadyOpen ? paperEl : openCleanView();
+                const container = isAlreadyOpen ? paperEl : await openCleanView();
                 await exportToPDF(container);
             } else if (action === 'export-word') {
-                const container = isAlreadyOpen ? paperEl : openCleanView();
+                const container = isAlreadyOpen ? paperEl : await openCleanView();
                 await exportToWord(container);
             } else if (action === 'system-print') {
-                if (!isAlreadyOpen) openCleanView();
+                if (!isAlreadyOpen) await openCleanView();
                 triggerSystemPrint(paperEl);
             }
         });
@@ -2295,11 +2663,11 @@
             if (action === 'close-modal') {
                 closeCleanView();
             } else if (action === 'deep-extract-modal') {
-                openDeepExtractView(currentSourceNode || document.body);
-                showToast('🔍 已深度提取当前区域所有隐藏节点 (display:none/visibility:hidden) 与 ::after 伪元素');
+                await openDeepExtractView(currentSourceNode || document.body);
+                showToast('🔍 已深度提取当前区域所有隐藏节点、伪元素与内嵌 iframe 文档');
             } else if (action === 'expand-parent') {
                 if (currentSourceNode && currentSourceNode.parentElement && currentSourceNode.parentElement !== document.documentElement) {
-                    openCleanView(currentSourceNode.parentElement);
+                    await openCleanView(currentSourceNode.parentElement);
                     showToast('🔼 已向上扩大一层识别范围');
                 } else {
                     showToast('已到达顶层容器');
@@ -2307,7 +2675,7 @@
             } else if (action === 'canvas-only') {
                 const canvases = findDocumentPageCanvases(document.body);
                 if (canvases.length > 0) {
-                    openCleanView(document.body, true);
+                    await openCleanView(document.body, true);
                     showToast(`🖼️ 已提取页面中 ${canvases.length} 个已渲染的文档画布页`);
                 } else {
                     showToast('⚠️ 当前页面未检测到已渲染的大尺寸文档 Canvas 画布');
