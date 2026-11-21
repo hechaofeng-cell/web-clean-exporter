@@ -18,8 +18,338 @@
     const APP_PREFIX = 'cre-exporter';
 
     // ==================== 0. 跨源/同源 iframe 文档预览框提取子模块 ====================
-    // 当网页使用内嵌可滚动 iframe（如下拉文档预览框）展示 Word/PDF 时，脚本在 iframe 内部静默运行，
-    // 不渲染任何悬浮按钮，仅响应顶层窗口的 postMessage 提取请求并返回纯净 HTML（含 Canvas 转图与图片转 Base64）。
+    // 4 级自适应提取引擎：
+    // Tier 1: 递归穿透嵌套子 iframe
+    // Tier 2: 整页文档图片 / CSS background-image 页面 / Canvas 画布页 / SVG 页面直接提取
+    // Tier 3: 绝对定位排版文档（pdf2htmlEX / 永中DCS / Office HTML 等）通过 Range 实时坐标重排为正常文档流
+    // Tier 4: 标准流式 HTML 清洗提取
+    async function extractRichHtmlFromDocument(targetWin, targetDoc, canvasCacheMap, isDeep = false) {
+        const root = targetDoc && targetDoc.body;
+        if (!root) return '';
+
+        const escapeTxt = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+        // 辅助：在目标文档同源上下文内将图片 URL 转为 Base64
+        async function fetchImgAsDataUrl(url) {
+            if (!url) return '';
+            if (url.startsWith('data:image/')) return url;
+            try {
+                const absUrl = new URL(url, targetDoc.baseURI).href;
+                const resp = await targetWin.fetch(absUrl, { credentials: 'include' });
+                if (resp.ok) {
+                    const blob = await resp.blob();
+                    if (blob.type && blob.type.startsWith('image/')) {
+                        const b64 = await new Promise((res) => {
+                            const r = new FileReader();
+                            r.onloadend = () => res(typeof r.result === 'string' && r.result.startsWith('data:image/') ? r.result : absUrl);
+                            r.onerror = () => res(absUrl);
+                            r.readAsDataURL(blob);
+                        });
+                        return b64;
+                    }
+                }
+                return absUrl;
+            } catch (_) {
+                try {
+                    return new URL(url, targetDoc.baseURI).href;
+                } catch (__) {
+                    return url;
+                }
+            }
+        }
+
+        // Tier 1: 检查是否存在大尺寸嵌套子 iframe（iframe 套 iframe）
+        const innerIframes = Array.from(root.querySelectorAll('iframe')).filter((f) => {
+            const r = f.getBoundingClientRect();
+            return r.width >= 300 && r.height >= 200;
+        });
+        if (innerIframes.length > 0) {
+            const nestedResults = await Promise.all(innerIframes.map((subFrame) => new Promise((resolve) => {
+                try {
+                    const subDoc = subFrame.contentDocument || (subFrame.contentWindow && subFrame.contentWindow.document);
+                    if (subDoc && subDoc.body) {
+                        extractRichHtmlFromDocument(subFrame.contentWindow, subDoc, new Map(), isDeep).then(resolve);
+                        return;
+                    }
+                } catch (_) {}
+
+                if (!subFrame.contentWindow) { resolve(''); return; }
+                const reqId = `cre_nested_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+                let done = false;
+                function onMsg(ev) {
+                    if (!ev.data || ev.data.type !== 'CRE_EXTRACT_IFRAME_RES' || ev.data.requestId !== reqId) return;
+                    done = true;
+                    clearTimeout(tm);
+                    targetWin.removeEventListener('message', onMsg);
+                    resolve(ev.data.html || '');
+                }
+                const tm = setTimeout(() => {
+                    if (!done) { done = true; targetWin.removeEventListener('message', onMsg); resolve(''); }
+                }, 1800);
+                targetWin.addEventListener('message', onMsg);
+                try {
+                    subFrame.contentWindow.postMessage({ type: 'CRE_EXTRACT_IFRAME_REQ', requestId: reqId, deep: isDeep }, '*');
+                } catch (_) {
+                    clearTimeout(tm); targetWin.removeEventListener('message', onMsg); resolve('');
+                }
+            })));
+            const joinedNested = nestedResults.filter(Boolean).join('\n');
+            if (joinedNested.trim().length > 20) {
+                return joinedNested;
+            }
+        }
+
+        // Tier 2: 检查整页文档图片（<img> / CSS background-image 页面 / <canvas> 页面 / 大尺寸 <svg> 页面）
+        const visualPages = [];
+        const scrollTopOffset = targetWin.scrollY || targetDoc.documentElement.scrollTop || root.scrollTop || 0;
+
+        // 2a. 大尺寸 Canvas 页面
+        Array.from(root.querySelectorAll('canvas')).forEach((c) => {
+            const r = c.getBoundingClientRect();
+            if (r.width < 300 || r.height < 240) return;
+            let dataUrl = null;
+            try {
+                if (c.width >= 300 && c.height >= 240) {
+                    const d = c.toDataURL('image/png');
+                    if (d && d.length > 2200) dataUrl = d;
+                }
+            } catch (_) {}
+            dataUrl = dataUrl || (canvasCacheMap && canvasCacheMap.get(c));
+            if (dataUrl) {
+                visualPages.push({ type: 'img', top: scrollTopOffset + r.top, src: dataUrl });
+            }
+        });
+
+        // 2b. 大尺寸 <img> 文档页
+        Array.from(root.querySelectorAll('img')).forEach((img) => {
+            const r = img.getBoundingClientRect();
+            const rawSrc = img.getAttribute('data-src') || img.getAttribute('data-original') || img.getAttribute('data-actualsrc') || img.getAttribute('src') || img.src;
+            if (!rawSrc) return;
+            if ((r.width >= 320 && r.height >= 260) || (img.naturalWidth >= 420 && img.naturalHeight >= 420)) {
+                visualPages.push({ type: 'img', top: scrollTopOffset + r.top, src: rawSrc });
+            }
+        });
+
+        // 2c. 大尺寸 CSS background-image 文档页（如原创力/淘豆/Office预览页 div 背景图）
+        Array.from(root.querySelectorAll('div, section, li, span')).forEach((el) => {
+            const r = el.getBoundingClientRect();
+            if (r.width < 320 || r.height < 260) return;
+            const bg = targetWin.getComputedStyle(el).backgroundImage;
+            if (bg && bg.startsWith('url(')) {
+                const m = bg.match(/url\(["']?([^"')]+)["']?\)/);
+                if (m && m[1] && !m[1].startsWith('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmci')) {
+                    visualPages.push({ type: 'img', top: scrollTopOffset + r.top, src: m[1] });
+                }
+            }
+        });
+
+        // 2d. 大尺寸 <svg> 文档页（保留内联样式）
+        Array.from(root.querySelectorAll('svg')).forEach((svg) => {
+            const r = svg.getBoundingClientRect();
+            if (r.width >= 320 && r.height >= 260) {
+                visualPages.push({ type: 'svg', top: scrollTopOffset + r.top, html: svg.outerHTML });
+            }
+        });
+
+        if (visualPages.length > 0) {
+            visualPages.sort((a, b) => a.top - b.top);
+            // 去重相同 URL
+            const seen = new Set();
+            const uniquePages = visualPages.filter((p) => {
+                const key = p.type === 'img' ? p.src : `svg_${Math.round(p.top)}`;
+                if (seen.has(key)) return false;
+                seen.add(key);
+                return true;
+            });
+
+            const renderedPages = await Promise.all(uniquePages.map(async (p, idx) => {
+                if (p.type === 'svg') {
+                    return `<div class="${APP_PREFIX}-canvas-page-item" style="margin:0 auto 16px auto;page-break-inside:avoid;">${p.html}</div>`;
+                }
+                const finalSrc = await fetchImgAsDataUrl(p.src);
+                return `<div class="${APP_PREFIX}-canvas-page-item" style="margin:0 auto 16px auto;page-break-inside:avoid;"><img src="${finalSrc}" alt="文档第 ${idx + 1} 页" class="${APP_PREFIX}-block-img" style="display:block;width:100%;max-width:100%;height:auto;border:1px solid #e2e8f0;" /></div>`;
+            }));
+            return renderedPages.join('\n');
+        }
+
+        // Tier 3: 检测是否为绝对定位排版文档（如 pdf2htmlEX / 永中DCS / WPS HTML 预览框）
+        // 这类文档每个文字片段都使用 position:absolute 定位，若直接克隆并删掉 <style> 会导致所有文字错位/重叠或仅剩一个碎片（如 "C.sheeps;cow"）！
+        let absoluteTextElCount = 0;
+        const sampleEls = root.querySelectorAll('div, span, p');
+        for (let i = 0; i < Math.min(sampleEls.length, 300); i++) {
+            const el = sampleEls[i];
+            if (el.childNodes.length > 0 && (el.textContent || '').trim().length > 0) {
+                const st = targetWin.getComputedStyle(el);
+                if (st.position === 'absolute') {
+                    absoluteTextElCount++;
+                }
+            }
+        }
+
+        if (absoluteTextElCount >= 6) {
+            // 使用 TreeWalker + Range.getBoundingClientRect() 获取每一个真实文本片段的视觉坐标 (docTop, left)，按行聚类重排为纯净段落流！
+            const items = [];
+            const walker = targetDoc.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+            let textNode;
+            while ((textNode = walker.nextNode())) {
+                const rawText = textNode.nodeValue;
+                if (!rawText || !rawText.trim()) continue;
+                const parentEl = textNode.parentElement;
+                if (!parentEl) continue;
+                const pTag = parentEl.tagName.toUpperCase();
+                if (['SCRIPT', 'STYLE', 'NOSCRIPT', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA'].includes(pTag)) continue;
+                if (!isDeep) {
+                    const st = targetWin.getComputedStyle(parentEl);
+                    if (st.display === 'none' || st.visibility === 'hidden') continue;
+                }
+                try {
+                    const range = targetDoc.createRange();
+                    range.selectNodeContents(textNode);
+                    const rect = range.getBoundingClientRect();
+                    if (rect.width > 0 || rect.height > 0 || isDeep) {
+                        items.push({
+                            kind: 'text',
+                            top: scrollTopOffset + rect.top,
+                            left: rect.left,
+                            text: rawText.replace(/\s+/g, ' ')
+                        });
+                    }
+                } catch (_) {}
+            }
+
+            // 同时收集内联/独立图片及其坐标
+            const inlineImgs = Array.from(root.querySelectorAll('img'));
+            for (const img of inlineImgs) {
+                const r = img.getBoundingClientRect();
+                const rawSrc = img.getAttribute('data-src') || img.getAttribute('data-original') || img.getAttribute('src') || img.src;
+                if (!rawSrc || (r.width < 8 && r.height < 8 && !isDeep)) continue;
+                const finalSrc = await fetchImgAsDataUrl(rawSrc);
+                items.push({
+                    kind: 'img',
+                    top: scrollTopOffset + r.top,
+                    left: r.left,
+                    width: r.width,
+                    height: r.height,
+                    src: finalSrc
+                });
+            }
+
+            if (items.length > 0) {
+                // 按垂直坐标 top 排序，将同一视觉水平基线（差距 <= 9px）内的片段聚成同一行，行内按 left 从左到右拼接
+                items.sort((a, b) => (Math.abs(a.top - b.top) <= 9 ? a.left - b.left : a.top - b.top));
+
+                const lines = [];
+                items.forEach((item) => {
+                    const lastLine = lines[lines.length - 1];
+                    if (lastLine && Math.abs(item.top - lastLine.top) <= 9) {
+                        lastLine.parts.push(item);
+                    } else {
+                        lines.push({ top: item.top, parts: [item] });
+                    }
+                });
+
+                const htmlLines = lines.map((line) => {
+                    line.parts.sort((a, b) => a.left - b.left);
+                    let lineHtml = '';
+                    line.parts.forEach((p, idx) => {
+                        if (p.kind === 'img') {
+                            const isBig = p.width >= 200 && p.height >= 24;
+                            const st = isBig
+                                ? 'max-width:100%;height:auto;display:block;margin:8px 0;'
+                                : 'max-width:100%;height:auto;display:inline-block;vertical-align:middle;margin:0 2px;';
+                            lineHtml += `<img src="${p.src}" style="${st}" />`;
+                        } else {
+                            const prev = idx > 0 ? line.parts[idx - 1] : null;
+                            const gap = prev ? p.left - (prev.left + (prev.text ? prev.text.length * 6 : 20)) : 0;
+                            const spacer = prev && gap > 18 ? '&nbsp;&nbsp;&nbsp;&nbsp;' : (lineHtml && !lineHtml.endsWith(' ') && !p.text.startsWith(' ') ? ' ' : '');
+                            lineHtml += spacer + escapeTxt(p.text);
+                        }
+                    });
+                    return `<p style="margin:0 0 8px 0;line-height:1.75;text-align:left;">${lineHtml.trim()}</p>`;
+                });
+
+                return htmlLines.join('\n');
+            }
+        }
+
+        // Tier 4: 标准流式 HTML 文档清洗提取（不误删 <svg> 内部样式，移除 position:absolute/fixed 错位）
+        const clone = root.cloneNode(true);
+        const origCanvases = root.querySelectorAll('canvas');
+        const cloneCanvases = clone.querySelectorAll('canvas');
+        if (origCanvases.length === cloneCanvases.length) {
+            origCanvases.forEach((origC, idx) => {
+                let dataUrl = null;
+                try {
+                    if (origC.width >= 24 && origC.height >= 18) {
+                        const d = origC.toDataURL('image/png');
+                        if (d && d.length > 1400) dataUrl = d;
+                    }
+                } catch (_) {}
+                dataUrl = dataUrl || (canvasCacheMap && canvasCacheMap.get(origC));
+                if (dataUrl) {
+                    const img = targetDoc.createElement('img');
+                    img.src = dataUrl;
+                    img.className = `${APP_PREFIX}-block-img`;
+                    img.style.display = 'block';
+                    img.style.maxWidth = '100%';
+                    img.style.height = 'auto';
+                    cloneCanvases[idx].replaceWith(img);
+                } else {
+                    cloneCanvases[idx].remove();
+                }
+            });
+        }
+
+        if (!isDeep) {
+            const origEls = root.querySelectorAll('*');
+            const cloneEls = clone.querySelectorAll('*');
+            if (origEls.length === cloneEls.length) {
+                for (let i = origEls.length - 1; i >= 0; i--) {
+                    const tag = origEls[i].tagName.toUpperCase();
+                    if (['BR', 'IMG', 'SVG', 'MATH'].includes(tag)) continue;
+                    const st = targetWin.getComputedStyle(origEls[i]);
+                    if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity) === 0) {
+                        cloneEls[i].remove();
+                    }
+                }
+            }
+        }
+
+        clone.querySelectorAll('script, noscript, iframe, button, input, select, textarea, nav, aside, footer').forEach(n => n.remove());
+        clone.querySelectorAll('style').forEach(st => {
+            if (!st.closest('svg')) st.remove();
+        });
+
+        const imgs = Array.from(clone.querySelectorAll('img'));
+        await Promise.all(imgs.map(async (img) => {
+            const lazy = img.getAttribute('data-src') || img.getAttribute('data-original') || img.getAttribute('data-actualsrc');
+            if ((!img.getAttribute('src') || img.getAttribute('src').startsWith('data:image/svg')) && lazy) {
+                img.setAttribute('src', lazy);
+            }
+            const rawSrc = img.getAttribute('src') || img.src;
+            if (!rawSrc) return;
+            const finalSrc = await fetchImgAsDataUrl(rawSrc);
+            img.setAttribute('src', finalSrc);
+            img.style.maxWidth = '100%';
+            img.style.height = 'auto';
+        }));
+
+        clone.querySelectorAll('*').forEach((el) => {
+            if (el.style) {
+                if (['fixed', 'sticky', 'absolute'].includes(el.style.position)) {
+                    el.style.position = 'static';
+                }
+                el.style.maxHeight = 'none';
+                el.style.overflow = 'visible';
+                if (el.style.height && el.style.height.endsWith('px') && ['DIV', 'SECTION', 'MAIN', 'ARTICLE'].includes(el.tagName)) {
+                    el.style.height = 'auto';
+                }
+            }
+        });
+
+        return clone.innerHTML.trim();
+    }
+
     if (window.top !== window.self) {
         const iframeCanvasCache = new Map();
 
@@ -46,111 +376,12 @@
         }, { passive: true });
         setTimeout(cacheIframeCanvases, 800);
 
-        async function extractIframeDocumentHtml(isDeep = false) {
-            cacheIframeCanvases();
-            const root = document.body;
-            if (!root) return '';
-
-            const clone = root.cloneNode(true);
-
-            // 1. 转换 iframe 内所有 Canvas 为 <img>
-            const origCanvases = root.querySelectorAll('canvas');
-            const cloneCanvases = clone.querySelectorAll('canvas');
-            if (origCanvases.length === cloneCanvases.length) {
-                origCanvases.forEach((origC, idx) => {
-                    let dataUrl = null;
-                    try {
-                        if (origC.width >= 30 && origC.height >= 20) {
-                            const d = origC.toDataURL('image/png');
-                            if (d && d.length > 1400) dataUrl = d;
-                        }
-                    } catch (_) {}
-                    dataUrl = dataUrl || iframeCanvasCache.get(origC);
-                    if (dataUrl) {
-                        const img = document.createElement('img');
-                        img.src = dataUrl;
-                        img.className = `${APP_PREFIX}-block-img`;
-                        img.style.display = 'block';
-                        img.style.maxWidth = '100%';
-                        img.style.height = 'auto';
-                        cloneCanvases[idx].replaceWith(img);
-                    } else {
-                        cloneCanvases[idx].remove();
-                    }
-                });
-            }
-
-            // 2. 移除隐藏节点（非深度模式下）与脚本/表单噪音
-            if (!isDeep) {
-                const origEls = root.querySelectorAll('*');
-                const cloneEls = clone.querySelectorAll('*');
-                if (origEls.length === cloneEls.length) {
-                    for (let i = origEls.length - 1; i >= 0; i--) {
-                        const tag = origEls[i].tagName.toUpperCase();
-                        if (['BR', 'IMG', 'SVG', 'MATH'].includes(tag)) continue;
-                        const st = window.getComputedStyle(origEls[i]);
-                        if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity) === 0) {
-                            cloneEls[i].remove();
-                        }
-                    }
-                }
-            }
-
-            clone.querySelectorAll('script, style, noscript, iframe, button, input, select, textarea, nav, aside, footer').forEach(n => n.remove());
-
-            // 3. 修复图片绝对路径并在 iframe 自身同源上下文内尝试转为 Base64（彻底绕过跨源限制）
-            const imgs = Array.from(clone.querySelectorAll('img'));
-            await Promise.all(imgs.map(async (img) => {
-                const lazy = img.getAttribute('data-src') || img.getAttribute('data-original') || img.getAttribute('data-actualsrc');
-                if ((!img.getAttribute('src') || img.getAttribute('src').startsWith('data:image/svg')) && lazy) {
-                    img.setAttribute('src', lazy);
-                }
-                const absSrc = img.src || img.getAttribute('src');
-                if (!absSrc) return;
-                img.setAttribute('src', absSrc);
-                if (!absSrc.startsWith('data:image/')) {
-                    try {
-                        const resp = await fetch(absSrc, { credentials: 'include' });
-                        if (resp.ok) {
-                            const blob = await resp.blob();
-                            if (blob.type && blob.type.startsWith('image/')) {
-                                const b64 = await new Promise((res) => {
-                                    const r = new FileReader();
-                                    r.onloadend = () => res(typeof r.result === 'string' && r.result.startsWith('data:image/') ? r.result : absSrc);
-                                    r.onerror = () => res(absSrc);
-                                    r.readAsDataURL(blob);
-                                });
-                                img.setAttribute('src', b64);
-                            }
-                        }
-                    } catch (_) {}
-                }
-                img.style.maxWidth = '100%';
-                img.style.height = 'auto';
-            }));
-
-            // 4. 解除滚动框固定高度与滚动裁剪，让所有页展开展示
-            clone.querySelectorAll('*').forEach((el) => {
-                if (el.style) {
-                    if (el.style.position === 'fixed' || el.style.position === 'sticky') {
-                        el.style.position = 'static';
-                    }
-                    el.style.maxHeight = 'none';
-                    el.style.overflow = 'visible';
-                    if (el.style.height && el.style.height.endsWith('px') && ['DIV', 'SECTION', 'MAIN', 'ARTICLE'].includes(el.tagName)) {
-                        el.style.height = 'auto';
-                    }
-                }
-            });
-
-            return clone.innerHTML.trim();
-        }
-
         window.addEventListener('message', async (event) => {
             const data = event.data;
             if (!data || data.type !== 'CRE_EXTRACT_IFRAME_REQ' || !data.requestId) return;
             try {
-                const html = await extractIframeDocumentHtml(Boolean(data.deep));
+                cacheIframeCanvases();
+                const html = await extractRichHtmlFromDocument(window, document, iframeCanvasCache, Boolean(data.deep));
                 if (event.source && typeof event.source.postMessage === 'function') {
                     event.source.postMessage({
                         type: 'CRE_EXTRACT_IFRAME_RES',
@@ -859,96 +1090,66 @@
                 return;
             }
 
-            // 1. 尝试同源直接读取 contentDocument
+            // 1. 尝试同源直接调用 4 级自适应提取引擎读取 contentDocument
             try {
                 const doc = iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
                 if (doc && doc.body) {
-                    const clone = doc.body.cloneNode(true);
-                    const origCanvases = doc.body.querySelectorAll('canvas');
-                    const cloneCanvases = clone.querySelectorAll('canvas');
-                    if (origCanvases.length === cloneCanvases.length) {
-                        origCanvases.forEach((c, idx) => {
-                            try {
-                                if (c.width >= 30 && c.height >= 20) {
-                                    const d = c.toDataURL('image/png');
-                                    if (d && d.length > 1400) {
-                                        const img = doc.createElement('img');
-                                        img.src = d;
-                                        img.className = `${APP_PREFIX}-block-img`;
-                                        cloneCanvases[idx].replaceWith(img);
-                                        return;
-                                    }
-                                }
-                            } catch (_) {}
-                            cloneCanvases[idx].remove();
-                        });
-                    }
-                    clone.querySelectorAll('script, style, noscript, iframe, button, input, select, textarea, nav, aside, footer').forEach(n => n.remove());
-                    clone.querySelectorAll('img').forEach(img => {
-                        const lazy = img.getAttribute('data-src') || img.getAttribute('data-original') || img.getAttribute('data-actualsrc');
-                        if ((!img.getAttribute('src') || img.getAttribute('src').startsWith('data:image/svg')) && lazy) {
-                            img.setAttribute('src', lazy);
-                        }
-                        if (img.src) img.setAttribute('src', img.src);
-                        img.style.maxWidth = '100%';
-                        img.style.height = 'auto';
-                    });
-                    clone.querySelectorAll('*').forEach(el => {
-                        if (el.style) {
-                            el.style.maxHeight = 'none';
-                            el.style.overflow = 'visible';
-                            if (el.style.height && el.style.height.endsWith('px') && ['DIV', 'SECTION', 'MAIN', 'ARTICLE'].includes(el.tagName)) {
-                                el.style.height = 'auto';
+                    extractRichHtmlFromDocument(iframe.contentWindow, doc, new Map(), isDeep)
+                        .then((html) => {
+                            if (html && html.trim()) {
+                                resolve(html);
+                            } else {
+                                // 若同源直读为空，仍尝试 postMessage 通道
+                                sendPostMessageRequest();
                             }
-                        }
-                    });
-                    const html = clone.innerHTML.trim();
-                    if (html) {
-                        resolve(html);
-                        return;
-                    }
+                        })
+                        .catch(() => sendPostMessageRequest());
+                    return;
                 }
             } catch (_) {
                 // 跨源 iframe，转入 postMessage 通道
             }
 
-            // 2. 跨源 iframe：通过 postMessage 向子窗口内运行的脚本请求正文 HTML
-            if (!iframe.contentWindow) {
-                resolve('');
-                return;
-            }
-            const requestId = `cre_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-            let settled = false;
+            function sendPostMessageRequest() {
+                if (!iframe.contentWindow) {
+                    resolve('');
+                    return;
+                }
+                const requestId = `cre_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+                let settled = false;
 
-            function onMessage(event) {
-                const data = event.data;
-                if (!data || data.type !== 'CRE_EXTRACT_IFRAME_RES' || data.requestId !== requestId) return;
-                settled = true;
-                clearTimeout(timer);
-                window.removeEventListener('message', onMessage);
-                resolve(typeof data.html === 'string' ? data.html : '');
-            }
-
-            const timer = setTimeout(() => {
-                if (!settled) {
+                function onMessage(event) {
+                    const data = event.data;
+                    if (!data || data.type !== 'CRE_EXTRACT_IFRAME_RES' || data.requestId !== requestId) return;
                     settled = true;
+                    clearTimeout(timer);
+                    window.removeEventListener('message', onMessage);
+                    resolve(typeof data.html === 'string' ? data.html : '');
+                }
+
+                const timer = setTimeout(() => {
+                    if (!settled) {
+                        settled = true;
+                        window.removeEventListener('message', onMessage);
+                        resolve('');
+                    }
+                }, 2600);
+
+                window.addEventListener('message', onMessage);
+                try {
+                    iframe.contentWindow.postMessage({
+                        type: 'CRE_EXTRACT_IFRAME_REQ',
+                        requestId,
+                        deep: isDeep
+                    }, '*');
+                } catch (_) {
+                    clearTimeout(timer);
                     window.removeEventListener('message', onMessage);
                     resolve('');
                 }
-            }, 2200);
-
-            window.addEventListener('message', onMessage);
-            try {
-                iframe.contentWindow.postMessage({
-                    type: 'CRE_EXTRACT_IFRAME_REQ',
-                    requestId,
-                    deep: isDeep
-                }, '*');
-            } catch (_) {
-                clearTimeout(timer);
-                window.removeEventListener('message', onMessage);
-                resolve('');
             }
+
+            sendPostMessageRequest();
         });
     }
 
