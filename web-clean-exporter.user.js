@@ -120,13 +120,89 @@
             }
         });
 
-        // 2b. 大尺寸 <img> 文档页
+        // 辅助：计算图片的真实可视裁剪区域（兼容 overflow:hidden 父容器、CSS clip:rect(...) 与雪碧图切片）
+        function getImageVisibleBox(img) {
+            const imgRect = img.getBoundingClientRect();
+            let left = imgRect.left;
+            let top = imgRect.top;
+            let right = imgRect.right;
+            let bottom = imgRect.bottom;
+
+            // 1. 解析 CSS clip: rect(t, r, b, l)
+            const st = targetWin.getComputedStyle(img);
+            if (st.clip && st.clip.startsWith('rect(')) {
+                const nums = st.clip.match(/-?\d+(\.\d+)?/g);
+                if (nums && nums.length === 4) {
+                    const ct = parseFloat(nums[0]);
+                    const cr = parseFloat(nums[1]);
+                    const cb = parseFloat(nums[2]);
+                    const cl = parseFloat(nums[3]);
+                    left = Math.max(left, imgRect.left + cl);
+                    top = Math.max(top, imgRect.top + ct);
+                    right = Math.min(right, imgRect.left + cr);
+                    bottom = Math.min(bottom, imgRect.top + cb);
+                }
+            }
+
+            // 2. 向上检查 4 层 overflow:hidden / clip 裁剪父容器
+            let anc = img.parentElement;
+            let depth = 0;
+            while (anc && anc !== targetDoc.body && depth < 4) {
+                const ancSt = targetWin.getComputedStyle(anc);
+                const ov = `${ancSt.overflow} ${ancSt.overflowX} ${ancSt.overflowY}`;
+                if (/hidden|clip/.test(ov)) {
+                    const ar = anc.getBoundingClientRect();
+                    if (ar.width > 0 && ar.height > 0) {
+                        left = Math.max(left, ar.left);
+                        top = Math.max(top, ar.top);
+                        right = Math.min(right, ar.right);
+                        bottom = Math.min(bottom, ar.bottom);
+                    }
+                }
+                anc = anc.parentElement;
+                depth++;
+            }
+
+            const width = Math.max(0, right - left);
+            const height = Math.max(0, bottom - top);
+            const isClipped = (imgRect.width > width * 1.35 + 4) || (imgRect.height > height * 1.35 + 4);
+            return { left, top, width, height, imgRect, isClipped };
+        }
+
+        // 辅助：将裁剪后的雪碧图切片精确绘制到离屏 Canvas 导出独立 PNG（保证 PDF 与 Word 中不出现整张雪碧图）
+        async function cropSpriteSliceToDataUrl(dataUrl, visBox) {
+            return new Promise((resolve) => {
+                const tmpImg = new Image();
+                tmpImg.onload = function () {
+                    try {
+                        const scaleX = (tmpImg.naturalWidth || visBox.imgRect.width) / (visBox.imgRect.width || 1);
+                        const scaleY = (tmpImg.naturalHeight || visBox.imgRect.height) / (visBox.imgRect.height || 1);
+                        const sx = Math.max(0, (visBox.left - visBox.imgRect.left) * scaleX);
+                        const sy = Math.max(0, (visBox.top - visBox.imgRect.top) * scaleY);
+                        const sw = Math.max(1, visBox.width * scaleX);
+                        const sh = Math.max(1, visBox.height * scaleY);
+                        const canvas = targetDoc.createElement('canvas');
+                        canvas.width = Math.max(1, Math.round(visBox.width * 2));
+                        canvas.height = Math.max(1, Math.round(visBox.height * 2));
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(tmpImg, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+                        resolve(canvas.toDataURL('image/png'));
+                    } catch (_) {
+                        resolve(null);
+                    }
+                };
+                tmpImg.onerror = () => resolve(null);
+                tmpImg.src = dataUrl;
+            });
+        }
+
+        // 2b. 大尺寸 <img> 文档页（使用可视裁剪区域，防止将下划线雪碧图误判为整页文档图）
         Array.from(root.querySelectorAll('img')).forEach((img) => {
-            const r = img.getBoundingClientRect();
+            const vb = getImageVisibleBox(img);
             const rawSrc = img.getAttribute('data-src') || img.getAttribute('data-original') || img.getAttribute('data-actualsrc') || img.getAttribute('src') || img.src;
-            if (!rawSrc) return;
-            if ((r.width >= 320 && r.height >= 260) || (img.naturalWidth >= 420 && img.naturalHeight >= 420)) {
-                visualPages.push({ type: 'img', top: scrollTopOffset + r.top, src: rawSrc });
+            if (!rawSrc || vb.isClipped) return;
+            if (vb.width >= 320 && vb.height >= 260) {
+                visualPages.push({ type: 'img', top: scrollTopOffset + vb.top, src: rawSrc });
             }
         });
 
@@ -217,31 +293,63 @@
                 } catch (_) {}
             }
 
-            // 同时收集内联/独立图片及其坐标
+            // 同时收集内联/独立图片及其真实可视坐标（自动识别填空下划线雪碧图并替换为清爽矢量下划线，真实配图切片则自动精确裁剪）
             const inlineImgs = Array.from(root.querySelectorAll('img'));
             for (const img of inlineImgs) {
-                const r = img.getBoundingClientRect();
+                const vb = getImageVisibleBox(img);
                 const rawSrc = img.getAttribute('data-src') || img.getAttribute('data-original') || img.getAttribute('src') || img.src;
-                if (!rawSrc || (r.width < 8 && r.height < 8 && !isDeep)) continue;
+                if (!rawSrc) continue;
+                if (vb.width <= 1 && vb.height <= 1 && !isDeep) continue;
+
+                // 情况 A：细长水平下划线图片或下划线雪碧图切片（高度 <= 14px、宽度 >= 12px）-> 直接转为清爽矢量填空下划线
+                if (vb.height > 0 && vb.height <= 14 && vb.width >= 12) {
+                    items.push({
+                        kind: 'blank',
+                        top: scrollTopOffset + vb.top - 10, // 向上对齐到所在行文字的基线
+                        left: vb.left,
+                        width: vb.width
+                    });
+                    continue;
+                }
+
+                // 情况 B：高度 > 14px 的被裁剪雪碧图切片 -> 用 Canvas 仅裁出可见区域，绝不输出整张雪碧大图
+                if (vb.isClipped) {
+                    if (vb.width < 8 || vb.height < 8) continue;
+                    const baseSrc = await fetchImgAsDataUrl(rawSrc);
+                    const croppedUrl = await cropSpriteSliceToDataUrl(baseSrc, vb);
+                    if (croppedUrl) {
+                        items.push({
+                            kind: 'img',
+                            top: scrollTopOffset + vb.top,
+                            left: vb.left,
+                            width: vb.width,
+                            height: vb.height,
+                            src: croppedUrl
+                        });
+                    }
+                    continue;
+                }
+
+                if (vb.width < 8 && vb.height < 8 && !isDeep) continue;
                 const finalSrc = await fetchImgAsDataUrl(rawSrc);
                 items.push({
                     kind: 'img',
-                    top: scrollTopOffset + r.top,
-                    left: r.left,
-                    width: r.width,
-                    height: r.height,
+                    top: scrollTopOffset + vb.top,
+                    left: vb.left,
+                    width: vb.width,
+                    height: vb.height,
                     src: finalSrc
                 });
             }
 
             if (items.length > 0) {
-                // 按垂直坐标 top 排序，将同一视觉水平基线（差距 <= 9px）内的片段聚成同一行，行内按 left 从左到右拼接
-                items.sort((a, b) => (Math.abs(a.top - b.top) <= 9 ? a.left - b.left : a.top - b.top));
+                // 按垂直坐标 top 排序，将同一视觉水平基线（差距 <= 11px）内的片段聚成同一行，行内按 left 从左到右拼接
+                items.sort((a, b) => (Math.abs(a.top - b.top) <= 11 ? a.left - b.left : a.top - b.top));
 
                 const lines = [];
                 items.forEach((item) => {
                     const lastLine = lines[lines.length - 1];
-                    if (lastLine && Math.abs(item.top - lastLine.top) <= 9) {
+                    if (lastLine && Math.abs(item.top - lastLine.top) <= 11) {
                         lastLine.parts.push(item);
                     } else {
                         lines.push({ top: item.top, parts: [item] });
@@ -252,7 +360,10 @@
                     line.parts.sort((a, b) => a.left - b.left);
                     let lineHtml = '';
                     line.parts.forEach((p, idx) => {
-                        if (p.kind === 'img') {
+                        if (p.kind === 'blank') {
+                            const w = Math.min(Math.max(Math.round(p.width), 36), 140);
+                            lineHtml += `<span style="display:inline-block;width:${w}px;border-bottom:1.2px solid #111827;vertical-align:baseline;margin:0 4px;">&nbsp;</span>`;
+                        } else if (p.kind === 'img') {
                             const isBig = p.width >= 200 && p.height >= 24;
                             const st = isBig
                                 ? 'max-width:100%;height:auto;display:block;margin:8px 0;'
@@ -260,8 +371,8 @@
                             lineHtml += `<img src="${p.src}" style="${st}" />`;
                         } else {
                             const prev = idx > 0 ? line.parts[idx - 1] : null;
-                            const gap = prev ? p.left - (prev.left + (prev.text ? prev.text.length * 6 : 20)) : 0;
-                            const spacer = prev && gap > 18 ? '&nbsp;&nbsp;&nbsp;&nbsp;' : (lineHtml && !lineHtml.endsWith(' ') && !p.text.startsWith(' ') ? ' ' : '');
+                            const gap = prev ? p.left - (prev.left + (prev.text ? prev.text.length * 6 : (prev.width || 20))) : 0;
+                            const spacer = prev && gap > 18 ? '&nbsp;&nbsp;&nbsp;&nbsp;' : (lineHtml && !lineHtml.endsWith(' ') && !lineHtml.endsWith('>') && !p.text.startsWith(' ') ? ' ' : '');
                             lineHtml += spacer + escapeTxt(p.text);
                         }
                     });
